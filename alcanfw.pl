@@ -244,7 +244,7 @@ sub main {
         $queue->set_verdict($msg->packet_id(), NF_ACCEPT) > 0 or die IPTables::IPv4::IPQueue->errstr;
     } elsif ($ret eq "Err") {
         print "[E] Dropping : $rname (pid:$pid) access to : $ip->{proto}:$ipdst:$ipdstport\n";
-        $queue->set_verdict($msg->packet_id(), NF_DROP); # > 0 or die IPTables::IPv4::IPQueue->errstr;
+        $queue->set_verdict($msg->packet_id(), NF_DROP) > 0 or die IPTables::IPv4::IPQueue->errstr;
     } elsif ($ret =~ /^(.*)$/) {
         print "[W] Dropping : $rname (pid:$pid) access to : $ip->{proto}:$ipdst:$ipdstport\n";
         $queue->set_verdict($msg->packet_id(), NF_DROP) > 0 or die IPTables::IPv4::IPQueue->errstr;
@@ -252,7 +252,6 @@ sub main {
         $session->{$ip->{proto}}->{$key}->{'app'} = $1;
         $session->{$ip->{proto}}->{$key}->{'pid'} = $pid;
     }
-    #print "* $ipsrc:$ipsrcport -> $ipdst:$ipdstport - $ret";
   }
 }
 
