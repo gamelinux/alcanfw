@@ -44,6 +44,8 @@ use strict;
 
 my $DEBUG = 0;
 my $VERBOSE = 0;
+my $FAST_PASS_VIA_NETFILTER = 0;
+my $ALLOW_LOCAL_DNS = 0;
 
 =head1 NAME
 
@@ -62,6 +64,8 @@ my $VERBOSE = 0;
  --daemon       : Not here yet!
  --debug        : enable debug messages
  --verbose      : makes it more verbose
+ --fastpass     : Fast pass packets with conntrack (ESTABLISHED,RELATED)
+ --localdns     : Allow local DNS lookups (DNS can be used as a covert channel!)
  --help         : this help message
 
 =cut
@@ -69,6 +73,8 @@ my $VERBOSE = 0;
 GetOptions(
     'debug'       => \$DEBUG,
     'verbose'     => \$VERBOSE,
+    'fastpass'    => \$FAST_PASS_VIA_NETFILTER,
+    'localdns'    => \$ALLOW_LOCAL_DNS,
 );
 
 $VERBOSE = 1 if ($DEBUG == 1);
@@ -79,7 +85,7 @@ my $_user = (getpwuid $>);
 die "[E] You need to be root!" if $_user ne 'root';
 
 print "[*] Starting alcanfw version 0.1.22-beta7\n";
-print "[*] Running with DEBUG=$DEBUG and VERBOSE=$VERBOSE\n";
+print "[*] Running with: debug=$DEBUG, verbose=$VERBOSE, fastpass=$FAST_PASS_VIA_NETFILTER, localdns=$ALLOW_LOCAL_DNS\n";
 
 my $e;
 print "[*] Tuning /proc/sys/net/core/[rw]mem_* values to $MEMVAL...\n"; 
@@ -94,6 +100,14 @@ $e = `iptables -F`;
 $e = `iptables -A INPUT -j ACCEPT`;
 $e = `iptables -A OUTPUT -j ACCEPT`;
 $e = `iptables -t mangle -F`;
+# If we have accepted a connection, why not let netfilter pass them all after that?
+# This saves lots of wasted userland cycles :)
+if ($FAST_PASS_VIA_NETFILTER == 1) {
+  $e = `iptables -t mangle -A OUTPUT -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT `;
+}
+if ($ALLOW_LOCAL_DNS == 1) {
+  $e = `iptables -t mangle -A OUTPUT -p udp -s 127.0.0.1 -d 127.0.0.1 --dport 53 -j ACCEPT`
+}
 $e = `iptables -t mangle -A OUTPUT -p tcp -j QUEUE`;
 $e = `iptables -t mangle -A OUTPUT -p udp -j QUEUE`;
 #$e = ``;
@@ -116,6 +130,7 @@ sub cleaner {
   # OR for quick test:
   $e = `iptables -t mangle -F`;
   $e = `iptables -F`;
+  clean_all_sessions();
   print "[*] Done\n";
   exit;
 }
@@ -148,11 +163,12 @@ sub main {
     my $key;
 
     if ($ip->{proto} == IP_PROTO_TCP) {
-      print "[D] IP_PROTO_TCP\n" if $DEBUG;
+      print "[D] IP_PROTO_TCP ($ipsrc -> $ipdst)\n" if $DEBUG;
       $tcp         = NetPacket::TCP->decode( $ip->{data} );
       $ipsrcport   = $tcp->{src_port};
       $ipdstport   = $tcp->{dest_port};
       $key = "$ipsrc:$ipsrcport:$ipdst:$ipdstport";
+      $session->{$ip->{proto}}->{$key}->{'lseen'} = time;
       if ( defined $session->{$ip->{proto}}->{$key}->{'access'} && $session->{$ip->{proto}}->{$key}->{'access'} == 1 ) {
         $queue->set_verdict($msg->packet_id(), NF_ACCEPT) > 0 or die IPTables::IPv4::IPQueue->errstr;
         print "[*] Fast Pass: $session->{$ip->{proto}}->{$key}->{'app'} $ipsrc:$ipsrcport -> $ipdst:$ipdstport (pid:$session->{$ip->{proto}}->{$key}->{'pid'})\n" if $VERBOSE;
@@ -166,11 +182,12 @@ sub main {
         $ret = `netstat -pant|grep "^tcp .*$ipsrc:$ipsrcport.*$ipdst:$ipdstport"|awk '{print \$7}'`;
       }
     } elsif ($ip->{proto} == IP_PROTO_UDP) {
-      print "[D] IP_PROTO_UDP\n" if $DEBUG;
+      print "[D] IP_PROTO_UDP ($ipsrc -> $ipdst)\n" if $DEBUG;
       $udp         = NetPacket::UDP->decode( $ip->{data} );
       $ipsrcport   = $udp->{src_port};
       $ipdstport   = $udp->{dest_port};
       $key = "$ipsrc:$ipsrcport:$ipdst:$ipdstport";
+      $session->{$ip->{proto}}->{$key}->{'lseen'} = time;
       if ( defined $session->{$ip->{proto}}->{$key}->{'access'} && $session->{$ip->{proto}}->{$key}->{'access'} == 1 ) {
         $queue->set_verdict($msg->packet_id(), NF_ACCEPT) > 0 or die IPTables::IPv4::IPQueue->errstr;
         print "[*] Fast Pass: $session->{$ip->{proto}}->{$key}->{'app'} $ipsrc:$ipsrcport -> $ipdst:$ipdstport (pid:$session->{$ip->{proto}}->{$key}->{'pid'})\n" if $VERBOSE;
@@ -183,6 +200,12 @@ sub main {
         # udp        0      0 127.0.0.1:39218         10.10.10.1:53            ESTABLISHED 28982/nc
         $ret = `netstat -panu|grep "^udp .*$ipsrc:$ipsrcport.*$ipdst:$ipdstport"|awk '{print \$7}'`;
       }
+    } else {
+      print "[W] We should never be here if things are set up correct!\n";
+      print "[W] But if we do get here, we just drop! And tell!\n";
+      print "[D] IP_PROTO_UNKNOWN ($ipsrc -> $ipdst) - Dropping!\n";
+      $queue->set_verdict($msg->packet_id(), NF_DROP) > 0 or die IPTables::IPv4::IPQueue->errstr;
+      next;
     }
 
     my $pid   = "";
@@ -242,6 +265,7 @@ sub main {
     } elsif ($ret =~ /^(-|)$/) {
         print "[*] Accepting: Closing/Dying Connection to : $ip->{proto}:$ipdst:$ipdstport\n" if $VERBOSE;
         $queue->set_verdict($msg->packet_id(), NF_ACCEPT) > 0 or die IPTables::IPv4::IPQueue->errstr;
+        clean_old_sessions($ip->{proto});
     } elsif ($ret eq "Err") {
         print "[E] Dropping : $rname (pid:$pid) access to : $ip->{proto}:$ipdst:$ipdstport\n";
         $queue->set_verdict($msg->packet_id(), NF_DROP) > 0 or die IPTables::IPv4::IPQueue->errstr;
@@ -253,6 +277,47 @@ sub main {
         $session->{$ip->{proto}}->{$key}->{'pid'} = $pid;
     }
   }
+}
+
+sub clean_old_sessions {
+   my $proto = shift;
+   my $keys  = $session->{$proto};
+   my $tnow  = time - 300; # Expire stuff after 5 minutes of idle
+   foreach my $key (keys(%$keys)) {
+      if (not defined $session->{$proto}->{$key}) {
+         print "Not Defined\n" if $DEBUG;
+         next;
+      }
+
+      if ( $session->{$proto}->{$key}->{'lseen'} < $tnow ) {
+         if ($DEBUG) {
+            print "[D] Deleting session: $key (";
+            if (defined $session->{$proto}->{$key}->{'pid'}) {
+               print "$session->{$proto}->{$key}->{'pid'} |";
+            } else {
+               print "- |";
+            }
+            if (defined $session->{$proto}->{$key}->{'app'}) {
+               print " $session->{$proto}->{$key}->{'app'}";
+            } else {
+               print " -";
+            }
+            print ")\n";
+         }
+         delete($session->{$proto}->{$key});
+      }
+   }
+}
+
+sub clean_all_sessions {
+   # Just to be nice :)
+   print "[*] Deleting all sessions...\n";
+   foreach my $proto (keys %$session) {
+      my $keys  = $session->{$proto};
+      foreach my $key (keys(%$keys)) {
+          delete($session->{$proto}->{$key});
+      }
+   }
 }
 
 main();
